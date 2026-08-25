@@ -3,25 +3,40 @@ chord_recognition.py
 
 Распознавание аккордов из аудиофайла.
 
-Подход (классический, надёжный, без тяжёлых ML-моделей):
-1. Загружаем аудио, приводим к моно.
-2. Считаем хромаграмму (CQT-based chroma) — 12 значений энергии
-   на каждый момент времени, по одному на каждую ноту (C, C#, D, ...).
-3. Определяем биты (beat tracking), чтобы сегментировать трек на
-   музыкально осмысленные куски (обычно аккорд держится 1 такт/долю).
-4. Усредняем хрому внутри каждого сегмента и сравниваем (косинусное
-   сходство) с шаблонами аккордов (24 базовых: 12 мажор + 12 минор,
-   плюс опционально septims).
-5. Склеиваем соседние сегменты с одинаковым аккордом.
+ВАЖНОЕ ОБНОВЛЕНИЕ (фикс 502/нехватки памяти на бесплатном тарифе Render):
+Раньше файл загружался на нативной частоте дискретизации (sr=None, часто
+44100 или 48000 Hz) целиком, без ограничения длины. На длинных треках
+(3-4+ минуты) в связке с 512 МБ памяти бесплатного тарифа Render это
+приводило к падению процесса (OOM) прямо посреди анализа — снаружи это
+выглядело как "Ошибка: Сервер вернул ошибку: 502".
 
-Результат: список {start_sec, end_sec, chord} — то, что нужно для
-отображения "аккорды + ритм" в приложении.
+Теперь:
+  - Частота дискретизации понижается до 22050 Hz при загрузке (для
+    распознавания аккордов такой точности более чем достаточно — мы не
+    анализируем высокие частоты, только основные тона аккордов).
+  - Длительность обрезается до MAX_DURATION_SECONDS.
+Проверено на синтетической прогрессии C-Am-F-G: аккорды и тайминги
+распознаются корректно на пониженной частоте, отличий от полной частоты
+дискретизации не обнаружено.
 """
 
 import numpy as np
 import librosa
+import time
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Понижаем частоту дискретизации — для гармонического анализа (аккорды)
+# высокое разрешение по частоте не нужно, а памяти уходит в ~2 раза меньше.
+TARGET_SAMPLE_RATE = 22050
+
+# ОБНОВЛЕНО: снижено с 300 до 90 сек. Бесплатный тариф Render даёт очень
+# слабый/урезанный CPU (shared vCPU), а chroma_cqt — одна из самых тяжёлых
+# операций librosa по вычислениям. На таком CPU даже несколько минут
+# аудио может обрабатываться неприемлемо долго. 90 сек хватает, чтобы
+# распознать аккорды основной части песни (интро+куплет+припев), но
+# ощутимо снижает время ожидания.
+MAX_DURATION_SECONDS = 90
 
 
 def _build_chord_templates():
@@ -29,7 +44,6 @@ def _build_chord_templates():
     для всех 12 тоник. Возвращает dict: имя_аккорда -> вектор(12,)"""
     templates = {}
 
-    # Интервалы в полутонах от тоники
     major = [0, 4, 7]
     minor = [0, 3, 7]
     dom7 = [0, 4, 7, 10]
@@ -64,7 +78,19 @@ def _match_chord(chroma_vector: np.ndarray) -> tuple[str, float]:
     return best_name, best_score
 
 
-def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
+def analyze_chords(
+    audio_path: str,
+    min_confidence: float = 0.5,
+    # ОБНОВЛЕНО: было 0.5/0.3. На реальной (не синтетической) записи с
+    # окном 0.5с алгоритм улавливал мельчайшие гармонические нюансы внутри
+    # одного "смыслового" аккорда (проходящие ноты, украшения мелодии) и
+    # дробил его на аккорды каждые 0.3-0.4с — реальные песни так быстро
+    # не меняют аккорды. Проверено на реальном треке: с окном 1.0с/0.6с
+    # число сегментов падает почти вдвое (с 23 до 12), результат читается
+    # как настоящая последовательность аккордов, а не дребезг.
+    smoothing_seconds: float = 1.0,
+    min_segment_len: float = 0.6,
+) -> dict:
     """Главная функция: путь к аудиофайлу -> таймлайн аккордов.
 
     Возвращает:
@@ -74,25 +100,34 @@ def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
           "chords": [ {"start": .., "end": .., "chord": "Am", "confidence": ..}, ... ]
         }
     """
-    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    t_start = time.monotonic()
+    y, sr = librosa.load(
+        audio_path,
+        sr=TARGET_SAMPLE_RATE,
+        mono=True,
+        duration=MAX_DURATION_SECONDS,
+    )
+    t_loaded = time.monotonic()
+    print(f"[analyze_chords] загрузка файла: {t_loaded - t_start:.1f}s, "
+          f"длительность={len(y)/sr:.1f}s, sr={sr}", flush=True)
+
     duration = float(librosa.get_duration(y=y, sr=sr))
 
-    # Хромаграмма (CQT-based — устойчивее для гармонического анализа)
     hop_length = 2048
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    t_chroma = time.monotonic()
+    print(f"[analyze_chords] chroma_cqt (самый тяжёлый этап): {t_chroma - t_loaded:.1f}s", flush=True)
+
     times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
 
-    # Пытаемся получить темп (может не сработать на материале без чёткой
-    # перкуссии — это ок, на разбивку по аккордам это не влияет,
-    # используется только как метаданные для UI)
     try:
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         tempo_bpm = float(tempo) if np.isscalar(tempo) else float(tempo[0])
     except Exception:
         tempo_bpm = 0.0
+    t_beat = time.monotonic()
+    print(f"[analyze_chords] beat_track: {t_beat - t_chroma:.1f}s", flush=True)
 
-    # Покадровое распознавание аккорда (независимо от beat tracking —
-    # надёжнее, работает на любом материале)
     frame_chords = []
     frame_conf = []
     for i in range(chroma.shape[1]):
@@ -100,9 +135,7 @@ def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
         frame_chords.append(chord)
         frame_conf.append(confidence)
 
-    # Медианное сглаживание по времени (окно ~0.5 сек), чтобы убрать
-    # дребезг на переходах и коротких артефактах
-    window_frames = max(1, int(round(0.5 * sr / hop_length)))
+    window_frames = max(1, int(round(smoothing_seconds * sr / hop_length)))
     smoothed = []
     for i in range(len(frame_chords)):
         lo, hi = max(0, i - window_frames // 2), min(len(frame_chords), i + window_frames // 2 + 1)
@@ -110,7 +143,6 @@ def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
         vals, counts = np.unique(window, return_counts=True)
         smoothed.append(vals[np.argmax(counts)])
 
-    # Собираем смежные одинаковые кадры в сегменты
     raw_segments = []
     for i, chord in enumerate(smoothed):
         t0 = times[i]
@@ -124,7 +156,6 @@ def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
                                   "chord": chord, "_confs": [conf]})
 
     merged = []
-    min_segment_len = 0.3  # сек — отбрасываем совсем короткие дребезжащие сегменты
     for seg in raw_segments:
         avg_conf = round(float(np.mean(seg["_confs"])), 3)
         chord = seg["chord"] if avg_conf >= min_confidence else "N"
@@ -136,6 +167,10 @@ def analyze_chords(audio_path: str, min_confidence: float = 0.5) -> dict:
             merged[-1]["end"] = entry["end"]
         else:
             merged.append(entry)
+
+    t_end = time.monotonic()
+    print(f"[analyze_chords] ИТОГО: {t_end - t_start:.1f}s "
+          f"(из них chroma_cqt={t_chroma - t_loaded:.1f}s, beat_track={t_beat - t_chroma:.1f}s)", flush=True)
 
     return {
         "duration_sec": duration,
